@@ -294,7 +294,7 @@ class QueensCountyBot(discord.Client):
             )
 
         return web.Response(
-            text="Roblox account linked successfully. Return to Discord and use "
+            text="✅ Your Roblox account was linked successfully! Return to Discord and try "
             "/account view to see your linked account.",
         )
 
@@ -429,8 +429,7 @@ account_group = app_commands.Group(
 async def account_link(interaction: discord.Interaction):
     if not bot.oauth_is_configured():
         await interaction.response.send_message(
-            "Roblox account linking is not configured. Set the Roblox OAuth "
-            "environment variables and restart the bot.",
+            "Roblox account linking is not configured.",
             ephemeral=True,
         )
         return
@@ -470,7 +469,7 @@ async def account_link(interaction: discord.Interaction):
         )
     )
     await interaction.response.send_message(
-        "Authorize the Roblox account you want to link:",
+        "Press the button below to link your account",
         view=view,
         ephemeral=True,
     )
