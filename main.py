@@ -39,14 +39,13 @@ logger = logging.getLogger(__name__)
 # Replace with your Discord server ID.
 GUILD_ID = 1084822318058053682
 
-
 class QueensCountyBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.oauth_states = {}
-        self.oauth_locks = {}
+        self.oauth_lock = asyncio.Lock()
         self.oauth_runner = None
         self.oauth_database = None
         self.oauth_cipher = None
@@ -102,6 +101,7 @@ class QueensCountyBot(discord.Client):
             CREATE TABLE IF NOT EXISTS linked_accounts (
                 discord_user_id TEXT PRIMARY KEY,
                 roblox_user_id TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL,
                 refresh_token TEXT NOT NULL
             )
             """
@@ -135,12 +135,6 @@ class QueensCountyBot(discord.Client):
 
     def oauth_is_configured(self):
         return self.oauth_cipher is not None
-
-    def oauth_lock_for(self, discord_user_id):
-        return self.oauth_locks.setdefault(
-            str(discord_user_id),
-            asyncio.Lock(),
-        )
 
     async def oauth_callback(self, request):
         state = request.query.get("state")
@@ -186,20 +180,10 @@ class QueensCountyBot(discord.Client):
                             status=502,
                         )
                     tokens = await response.json()
-                    if not isinstance(tokens, dict):
-                        logger.error("Roblox OAuth token response was not an object")
-                        return web.Response(
-                            text="Roblox authorization returned an invalid response. "
-                            "Please try again.",
-                            status=502,
-                        )
 
                 access_token = tokens.get("access_token")
                 refresh_token = tokens.get("refresh_token")
-                if (
-                    not isinstance(access_token, str)
-                    or not isinstance(refresh_token, str)
-                ):
+                if not access_token or not refresh_token:
                     logger.error("Roblox OAuth response did not include required tokens")
                     return web.Response(
                         text="Roblox authorization returned an incomplete response. "
@@ -222,12 +206,7 @@ class QueensCountyBot(discord.Client):
             or userinfo.get("nickname")
             or userinfo.get("name")
         )
-        if (
-            not isinstance(roblox_user_id, str)
-            or not roblox_user_id.isdigit()
-            or not isinstance(username, str)
-            or not username
-        ):
+        if not roblox_user_id or not username:
             logger.error("Roblox userinfo response was missing account identity claims")
             return web.Response(
                 text="Roblox did not return the account details needed for linking. "
@@ -239,40 +218,34 @@ class QueensCountyBot(discord.Client):
             refresh_token.encode("utf-8")
         ).decode("ascii")
         try:
-            async with self.oauth_lock_for(pending["discord_user_id"]):
-                self.oauth_database.execute(
-                    """
-                    INSERT INTO linked_accounts (
-                        discord_user_id, roblox_user_id, refresh_token
-                    ) VALUES (?, ?, ?)
-                    ON CONFLICT(discord_user_id) DO UPDATE SET
-                        roblox_user_id = excluded.roblox_user_id,
-                        refresh_token = excluded.refresh_token
-                    """,
-                    (
-                        pending["discord_user_id"],
-                        str(roblox_user_id),
-                        encrypted_refresh_token,
-                    ),
-                )
-                self.oauth_database.commit()
+            self.oauth_database.execute(
+                """
+                INSERT INTO linked_accounts (
+                    discord_user_id, roblox_user_id, username, refresh_token
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(discord_user_id) DO UPDATE SET
+                    roblox_user_id = excluded.roblox_user_id,
+                    username = excluded.username,
+                    refresh_token = excluded.refresh_token
+                """,
+                (
+                    pending["discord_user_id"],
+                    str(roblox_user_id),
+                    str(username),
+                    encrypted_refresh_token,
+                ),
+            )
+            self.oauth_database.commit()
         except sqlite3.IntegrityError:
             return web.Response(
                 text="That Roblox account is already linked to another Discord account. "
                 "You can close this page.",
                 status=409,
             )
-        except sqlite3.Error:
-            logger.exception("Could not save the linked Roblox account")
-            return web.Response(
-                text="Roblox authorization succeeded, but the account could not "
-                "be saved. Please contact the bot administrator.",
-                status=500,
-            )
 
         return web.Response(
-            text=f"Roblox account @{username} linked successfully. Return to "
-            "Discord and use /account view to see your linked account.",
+            text="Roblox account linked successfully. Return to Discord and use "
+            "/account view to see your linked account.",
         )
 
     async def fetch_userinfo(self, session, access_token):
@@ -291,31 +264,28 @@ class QueensCountyBot(discord.Client):
                     response.history,
                     status=response.status,
                 )
-            userinfo = await response.json()
-            if not isinstance(userinfo, dict):
-                raise ValueError("Roblox userinfo response was not an object")
-            return userinfo
+            return await response.json()
 
-    async def get_account_userinfo(self, discord_user_id):
-        async with self.oauth_lock_for(discord_user_id):
-            row = self.oauth_database.execute(
-                "SELECT refresh_token FROM linked_accounts WHERE discord_user_id = ?",
-                (str(discord_user_id),),
-            ).fetchone()
-            if row is None:
-                return None
+    async def get_account_access_token(self, discord_user_id):
+        row = self.oauth_database.execute(
+            "SELECT refresh_token FROM linked_accounts WHERE discord_user_id = ?",
+            (str(discord_user_id),),
+        ).fetchone()
+        if row is None:
+            return None, None
 
-            try:
-                refresh_token = self.oauth_cipher.decrypt(
-                    row[0].encode("ascii")
-                ).decode("utf-8")
-            except (InvalidToken, UnicodeEncodeError, UnicodeDecodeError):
-                logger.exception("Stored Roblox OAuth token could not be decrypted")
-                raise RuntimeError(
-                    "The stored authorization cannot be read. Please relink with "
-                    "/account link."
-                )
+        try:
+            refresh_token = self.oauth_cipher.decrypt(row[0].encode("ascii")).decode(
+                "utf-8"
+            )
+        except (InvalidToken, UnicodeEncodeError, UnicodeDecodeError):
+            logger.exception("Stored Roblox OAuth token could not be decrypted")
+            raise RuntimeError(
+                "The stored authorization cannot be read. Please relink with "
+                "/account link."
+            )
 
+        async with self.oauth_lock:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     OAUTH_TOKEN_URL,
@@ -337,19 +307,10 @@ class QueensCountyBot(discord.Client):
                             "Please try again or relink with /account link."
                         )
                     tokens = await response.json()
-                    if not isinstance(tokens, dict):
-                        logger.error("Roblox OAuth refresh response was not an object")
-                        raise RuntimeError(
-                            "Roblox returned an invalid authorization response. "
-                            "Please relink with /account link."
-                        )
 
                 access_token = tokens.get("access_token")
                 new_refresh_token = tokens.get("refresh_token")
-                if (
-                    not isinstance(access_token, str)
-                    or not isinstance(new_refresh_token, str)
-                ):
+                if not access_token or not new_refresh_token:
                     logger.error("Roblox OAuth refresh response was incomplete")
                     raise RuntimeError(
                         "Roblox returned an incomplete authorization response. "
@@ -367,7 +328,7 @@ class QueensCountyBot(discord.Client):
                 self.oauth_database.commit()
                 userinfo = await self.fetch_userinfo(session, access_token)
 
-        return userinfo
+        return access_token, userinfo
 
 
 bot = QueensCountyBot()
@@ -433,17 +394,8 @@ async def account_view(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     try:
-        userinfo = await bot.get_account_userinfo(interaction.user.id)
-    except (
-        aiohttp.ClientError,
-        asyncio.TimeoutError,
-        RuntimeError,
-        sqlite3.Error,
-        ValueError,
-    ) as error:
-        if isinstance(error, sqlite3.Error):
-            logger.exception("Could not read linked Roblox account")
-            error = RuntimeError("Could not read your linked Roblox account.")
+        _, userinfo = await bot.get_account_access_token(interaction.user.id)
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as error:
         await interaction.followup.send(str(error), ephemeral=True)
         return
 
@@ -460,12 +412,7 @@ async def account_view(interaction: discord.Interaction):
         or userinfo.get("nickname")
         or userinfo.get("name")
     )
-    if (
-        not isinstance(roblox_user_id, str)
-        or not roblox_user_id.isdigit()
-        or not isinstance(username, str)
-        or not username
-    ):
+    if not roblox_user_id or not username:
         await interaction.followup.send(
             "Roblox did not return your account details. Please relink with "
             "/account link.",
@@ -480,7 +427,7 @@ async def account_view(interaction: discord.Interaction):
     )
     embed.add_field(name="Username", value=str(username), inline=True)
     embed.add_field(name="Roblox user ID", value=str(roblox_user_id), inline=True)
-    if isinstance(userinfo.get("picture"), str):
+    if userinfo.get("picture"):
         embed.set_thumbnail(url=userinfo["picture"])
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -561,5 +508,4 @@ async def announce(
         )
 
 
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+bot.run(DISCORD_TOKEN)
