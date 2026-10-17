@@ -164,7 +164,7 @@ class QueensCountyBot(discord.Client):
             "code_verifier": pending["code_verifier"],
         }
         try:
-            async with aiohttp.ClientSession( connector=aiohttp.TCPonnector( family=socket.AF_INET ) ) as session:
+            async with aiohttp.ClientSession( connector=aiohttp.TCPConnector( family=socket.AF_INET ) ) as session:
                 async with session.post(
                     OAUTH_TOKEN_URL,
                     data=form,
@@ -287,7 +287,7 @@ class QueensCountyBot(discord.Client):
             )
 
         async with self.oauth_lock:
-            async with aiohttp.ClientSession( connector=aiohttp.TCPonnector( family=socket.AF_INET ) ) as session:
+            async with aiohttp.ClientSession( connector=aiohttp.TCPConnector( family=socket.AF_INET ) ) as session:
                 async with session.post(
                     OAUTH_TOKEN_URL,
                     data={
@@ -481,7 +481,7 @@ async def announce(
     await interaction.response.defer(ephemeral=True)
 
     try:
-        async with aiohttp.ClientSession( connector=aiohttp.TCPonnector( family=socket.AF_INET ) ) as session:
+        async with aiohttp.ClientSession( connector=aiohttp.TCPConnector( family=socket.AF_INET ) ) as session:
             async with session.post(
                 url,
                 headers=headers,
