@@ -462,8 +462,16 @@ async def account_link(interaction: discord.Interaction):
             "state": state,
         }
     )
+    view = discord.ui.View()
+    view.add_item(
+        discord.ui.Button(
+            label="Authorize with Roblox",
+            url=authorization_url,
+        )
+    )
     await interaction.response.send_message(
-        f"Authorize the Roblox account you want to link: {authorization_url}",
+        "Authorize the Roblox account you want to link:",
+        view=view,
         ephemeral=True,
     )
 
