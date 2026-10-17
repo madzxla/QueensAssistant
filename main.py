@@ -299,22 +299,45 @@ class QueensCountyBot(discord.Client):
         )
 
     async def fetch_userinfo(self, session, access_token):
-        async with session.get(
-            OAUTH_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as response:
-            if response.status != 200:
+        def request_userinfo():
+            request = urllib.request.Request(
+                OAUTH_USERINFO_URL,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "User-Agent": "QueensAssistant/1.0",
+                },
+                method="GET",
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return response.status, response.read().decode("utf-8")
+            except urllib.error.HTTPError as error:
+                return error.code, error.read().decode("utf-8")
+
+        try:
+            status, body = await asyncio.to_thread(request_userinfo)
+
+            if status != 200:
                 logger.warning(
-                    "Roblox OAuth userinfo request failed with status %s",
-                    response.status,
+                    "Roblox OAuth userinfo request failed with status %s: %s",
+                    status,
+                    body[:500],
                 )
-                raise aiohttp.ClientResponseError(
-                    response.request_info,
-                    response.history,
-                    status=response.status,
+                raise RuntimeError(
+                    "Could not retrieve your Roblox account details. "
+                    "Please try again or relink with /account link."
                 )
-            return await response.json()
+
+            return json.loads(body)
+
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            logger.exception("Roblox OAuth userinfo request failed")
+            raise RuntimeError(
+                "Could not contact Roblox to retrieve your account details. "
+                "Please try again."
+            )
 
     async def get_account_access_token(self, discord_user_id):
         row = self.oauth_database.execute(
