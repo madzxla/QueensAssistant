@@ -1,12 +1,17 @@
 import asyncio
 import base64
 import hashlib
-import os
 import json
 import logging
+import os
 import secrets
+import socket
 import sqlite3
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
 from urllib.parse import urlencode, urlsplit
 
 import aiohttp
@@ -36,6 +41,30 @@ OAUTH_TOKEN_URL = "https://apis.roblox.com/oauth/v1/token"
 OAUTH_USERINFO_URL = "https://apis.roblox.com/oauth/v1/userinfo"
 OAUTH_STATE_TTL_SECONDS = 600
 logger = logging.getLogger(__name__)
+
+def _roblox_token_request_sync(data: dict) -> tuple[int, str]:
+    body = urllib.parse.urlencode(data).encode("utf-8")
+
+    request = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "QueensAssistant/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8")
+
+
+async def roblox_token_request(data: dict) -> tuple[int, str]:
+    return await asyncio.to_thread(_roblox_token_request_sync, data)
 
 # Replace with your Discord server ID.
 GUILD_ID = 1084822318058053682
@@ -164,35 +193,55 @@ class QueensCountyBot(discord.Client):
             "code_verifier": pending["code_verifier"],
         }
         try:
-            async with aiohttp.ClientSession( connector=aiohttp.TCPConnector( family=socket.AF_INET ) ) as session:
-                async with session.post(
-                    OAUTH_TOKEN_URL,
-                    data=form,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(
-                            "Roblox OAuth code exchange failed with status %s",
-                            response.status,
-                        )
-                        return web.Response(
-                            text="Roblox authorization could not be completed. "
-                            "Return to Discord and try /account link again.",
-                            status=502,
-                        )
-                    tokens = await response.json()
+            token_status, token_body = await roblox_token_request(form)
 
-                access_token = tokens.get("access_token")
-                refresh_token = tokens.get("refresh_token")
-                if not access_token or not refresh_token:
-                    logger.error("Roblox OAuth response did not include required tokens")
-                    return web.Response(
-                        text="Roblox authorization returned an incomplete response. "
-                        "Please try again.",
-                        status=502,
-                    )
+            if token_status != 200:
+                logger.warning(
+                    "Roblox OAuth code exchange failed with status %s: %s",
+                    token_status,
+                    token_body[:500],
+                )
+                return web.Response(
+                    text="Roblox authorization could not be completed. "
+                    "Return to Discord and try /account link again.",
+                    status=502,
+                )
 
+            tokens = json.loads(token_body)
+
+            access_token = tokens.get("access_token")
+            refresh_token = tokens.get("refresh_token")
+
+            if not access_token or not refresh_token:
+                logger.error(
+                    "Roblox OAuth response did not include required tokens"
+                )
+                return web.Response(
+                    text="Roblox authorization returned an incomplete response. "
+                    "Please try again.",
+                    status=502,
+                )
+
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(family=socket.AF_INET)
+            ) as session:
                 userinfo = await self.fetch_userinfo(session, access_token)
+
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            ValueError,
+            urllib.error.URLError,
+        ):
+            logger.exception("Roblox OAuth callback request failed")
+            return web.Response(
+                text="Could not contact Roblox to finish linking. "
+                "Return to Discord and try again.",
+                status=502,
+            )
+            userinfo = await self.fetch_userinfo(session, access_token)
+
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             logger.exception("Roblox OAuth callback request failed")
             return web.Response(
@@ -287,46 +336,59 @@ class QueensCountyBot(discord.Client):
             )
 
         async with self.oauth_lock:
-            async with aiohttp.ClientSession( connector=aiohttp.TCPConnector( family=socket.AF_INET ) ) as session:
-                async with session.post(
-                    OAUTH_TOKEN_URL,
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                        "client_id": ROBLOX_OAUTH_CLIENT_ID,
-                        "client_secret": ROBLOX_OAUTH_CLIENT_SECRET,
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(
-                            "Roblox OAuth token refresh failed with status %s",
-                            response.status,
-                        )
-                        raise RuntimeError(
-                            "Could not refresh your Roblox authorization. "
-                            "Please try again or relink with /account link."
-                        )
-                    tokens = await response.json()
+            token_status, token_body = await roblox_token_request(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": ROBLOX_OAUTH_CLIENT_ID,
+                    "client_secret": ROBLOX_OAUTH_CLIENT_SECRET,
+                }
+            )
 
-                access_token = tokens.get("access_token")
-                new_refresh_token = tokens.get("refresh_token")
-                if not access_token or not new_refresh_token:
-                    logger.error("Roblox OAuth refresh response was incomplete")
-                    raise RuntimeError(
-                        "Roblox returned an incomplete authorization response. "
-                        "Please relink with /account link."
-                    )
-
-                encrypted_refresh_token = self.oauth_cipher.encrypt(
-                    new_refresh_token.encode("utf-8")
-                ).decode("ascii")
-                self.oauth_database.execute(
-                    "UPDATE linked_accounts SET refresh_token = ? "
-                    "WHERE discord_user_id = ?",
-                    (encrypted_refresh_token, str(discord_user_id)),
+            if token_status != 200:
+                logger.warning(
+                    "Roblox OAuth token refresh failed with status %s: %s",
+                    token_status,
+                    token_body[:500],
                 )
-                self.oauth_database.commit()
+                raise RuntimeError(
+                    "Could not refresh your Roblox authorization. "
+                    "Please try again or relink with /account link."
+                )
+
+            try:
+                tokens = json.loads(token_body)
+            except json.JSONDecodeError as error:
+                logger.error("Roblox OAuth refresh returned invalid JSON")
+                raise RuntimeError(
+                    "Roblox returned an invalid authorization response. "
+                    "Please try again."
+                ) from error
+
+            access_token = tokens.get("access_token")
+            new_refresh_token = tokens.get("refresh_token")
+
+            if not access_token or not new_refresh_token:
+                logger.error("Roblox OAuth refresh response was incomplete")
+                raise RuntimeError(
+                    "Roblox returned an incomplete authorization response. "
+                    "Please relink with /account link."
+                )
+
+            encrypted_refresh_token = self.oauth_cipher.encrypt(
+                new_refresh_token.encode("utf-8")
+            ).decode("ascii")
+
+            self.oauth_database.execute(
+                "UPDATE linked_accounts SET refresh_token = ? "
+                "WHERE discord_user_id = ?",
+                (encrypted_refresh_token, str(discord_user_id)),
+            )
+            self.oauth_database.commit()
+
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(family=socket.AF_INET)
+            ) as session:
                 userinfo = await self.fetch_userinfo(session, access_token)
 
         return access_token, userinfo
