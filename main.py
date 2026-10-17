@@ -68,6 +68,7 @@ async def roblox_token_request(data: dict) -> tuple[int, str]:
 
 # Replace with your Discord server ID.
 GUILD_ID = 1084822318058053682
+LINKED_ROLE_ID = 1561039063178281060
 
 class QueensCountyBot(discord.Client):
     def __init__(self):
@@ -79,6 +80,7 @@ class QueensCountyBot(discord.Client):
         self.oauth_runner = None
         self.oauth_database = None
         self.oauth_cipher = None
+        self.linked_roles_reconciled = False
 
     async def setup_hook(self):
         guild = discord.Object(id=GUILD_ID)
@@ -155,6 +157,72 @@ class QueensCountyBot(discord.Client):
             ROBLOX_OAUTH_PORT,
             callback_path,
         )
+
+    async def on_ready(self):
+        if not self.oauth_is_configured() or self.linked_roles_reconciled:
+            return
+
+        linked_user_ids = self.oauth_database.execute(
+            "SELECT discord_user_id FROM linked_accounts"
+        ).fetchall()
+        for (discord_user_id,) in linked_user_ids:
+            await self.assign_linked_role(discord_user_id)
+
+        self.linked_roles_reconciled = True
+        logger.info(
+            "Reconciled linked Roblox role for %s linked accounts",
+            len(linked_user_ids),
+        )
+
+    async def assign_linked_role(self, discord_user_id):
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            logger.error(
+                "Cannot assign linked role: Discord guild %s is unavailable",
+                GUILD_ID,
+            )
+            return False
+
+        role = guild.get_role(LINKED_ROLE_ID)
+        if role is None:
+            logger.error(
+                "Cannot assign linked role: role %s was not found in guild %s",
+                LINKED_ROLE_ID,
+                GUILD_ID,
+            )
+            return False
+
+        try:
+            member = guild.get_member(int(discord_user_id))
+            if member is None:
+                member = await guild.fetch_member(int(discord_user_id))
+        except discord.NotFound:
+            logger.warning(
+                "Cannot assign linked role: Discord user %s is not a member of guild %s",
+                discord_user_id,
+                GUILD_ID,
+            )
+            return False
+        except discord.HTTPException:
+            logger.exception(
+                "Could not retrieve Discord member %s to assign linked role",
+                discord_user_id,
+            )
+            return False
+
+        if role in member.roles:
+            return True
+
+        try:
+            await member.add_roles(role, reason="Linked Roblox account")
+        except discord.HTTPException:
+            logger.exception(
+                "Could not assign linked role %s to Discord member %s",
+                LINKED_ROLE_ID,
+                discord_user_id,
+            )
+            return False
+        return True
 
     async def close(self):
         if self.oauth_runner is not None:
@@ -291,6 +359,13 @@ class QueensCountyBot(discord.Client):
                 text="That Roblox account is already linked to another Discord account. "
                 "You can close this page.",
                 status=409,
+            )
+
+        role_assigned = await self.assign_linked_role(pending["discord_user_id"])
+        if not role_assigned:
+            return web.Response(
+                text="Your Roblox account was linked successfully, but the Discord "
+                "role could not be assigned. Please contact a server administrator.",
             )
 
         return web.Response(
